@@ -1,0 +1,13 @@
+services:
+  roomba:
+    build: ./app
+    container_name: roomba
+    restart: unless-stopped
+    env_file: .env
+    environment:
+      TZ: ${TZ:-Europe/Amsterdam}
+    ports:
+      # Bind to a LAN/VPN address only. Never expose this to the internet: there is no authentication.
+      - "${BIND_IP:-127.0.0.1}:8083:8080"
+    volumes:
+      - ./data:/app/data

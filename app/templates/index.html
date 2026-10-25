@@ -1,0 +1,195 @@
+<!doctype html>
+<html lang="en">
+<head>
+<meta charset="utf-8">
+<meta name="viewport" content="width=device-width, initial-scale=1">
+<title>Roomba</title>
+<style>
+  body { font-family: system-ui, sans-serif; margin: 0; padding: 12px; max-width: 720px; background: #fff; color: #111; }
+  h1 { font-size: 1.3em; margin: 0 0 8px; }
+  h2 { font-size: 1em; margin: 18px 0 6px; border-bottom: 1px solid #ccc; }
+  table { border-collapse: collapse; width: 100%; }
+  td, th { text-align: left; padding: 3px 6px; vertical-align: top; }
+  th { font-weight: normal; color: #555; width: 42%; }
+  button { font-size: 1em; padding: 8px 12px; margin: 3px 3px 3px 0; }
+  .row { display: flex; flex-wrap: wrap; gap: 4px; }
+  fieldset { border: 1px solid #ccc; margin: 6px 0; padding: 6px 8px; }
+  legend { color: #555; font-size: .9em; }
+  label { margin-right: 10px; white-space: nowrap; }
+  .alarm { color: #b00; font-weight: bold; }
+  .ok { color: #070; }
+  .dim { color: #777; font-size: .9em; }
+  #message { min-height: 1.2em; margin: 6px 0; }
+  ul { padding-left: 18px; margin: 4px 0; }
+  code { font-size: .9em; }
+</style>
+</head>
+<body>
+<h1>Roomba <span id="conn" class="dim"></span></h1>
+<div id="message"></div>
+
+<h2>Status</h2>
+<table id="status"></table>
+
+<h2>Clean</h2>
+<fieldset><legend>Mode</legend>
+  <label><input type="radio" name="mode" value="vacuum" checked> vacuum only</label>
+  <label><input type="radio" name="mode" value="mop"> mop only</label>
+  <label><input type="radio" name="mode" value="vacuum+mop"> vacuum + mop</label>
+</fieldset>
+<fieldset><legend>Suction</legend>
+  <label><input type="radio" name="suction" value="eco"> eco</label>
+  <label><input type="radio" name="suction" value="normal" checked> normal</label>
+  <label><input type="radio" name="suction" value="high"> high</label>
+</fieldset>
+<fieldset><legend>Water (mop modes only)</legend>
+  <label><input type="radio" name="water" value="1"> eco</label>
+  <label><input type="radio" name="water" value="2" checked> standard</label>
+  <label><input type="radio" name="water" value="3"> max</label>
+  <label><input type="checkbox" id="scrub"> SmartScrub</label>
+  <label><input type="checkbox" id="padWashAfter"> wash pad afterwards</label>
+</fieldset>
+<fieldset><legend>Passes</legend>
+  <label><input type="radio" name="passes" value="1" checked> 1</label>
+  <label><input type="radio" name="passes" value="2"> 2</label>
+  <label><input type="radio" name="passes" value="auto"> automatic</label>
+</fieldset>
+<fieldset><legend>Rooms (none = whole house)</legend>
+  <div id="rooms" class="row dim">no rooms known</div>
+  <p class="dim">Importing rooms: release the bridge (button below), start a run in the iRobot app with <b>some</b> of the
+    rooms ticked (with all rooms ticked the app sends no room list), swipe the iRobot app away <b>without stopping</b>
+    (stopping overwrites the command), wait until the bridge is connected again, then
+    <button onclick="post('/api/rooms/import', {})">import rooms from last app command</button>
+    and then click Dock here. Repeat with the remaining rooms; the lists are merged.</p>
+</fieldset>
+<div class="row">
+  <button onclick="start()">Start</button>
+  <button onclick="cmd('pause')">Pause</button>
+  <button onclick="cmd('resume')">Resume</button>
+  <button onclick="cmd('stop')">Stop</button>
+  <button onclick="cmd('dock')">Dock</button>
+  <button onclick="cmd('evac')">Empty bin</button>
+  <button onclick="cmd('find')">Beep</button>
+</div>
+
+<h2>Allow the iRobot app (capture commands)</h2>
+<p class="dim">The robot accepts one local connection. Release the bridge for 10 minutes, do in the iRobot app what you want
+  to capture (dock buttons, rooms), and the bridge then logs the new command under Events as "appCommand".
+  For rooms, click "import rooms" afterwards.</p>
+<div class="row">
+  <button onclick="post('/api/bridge/pause', {minutes: 10})">allow iRobot app for 10 min</button>
+  <button onclick="post('/api/bridge/resume', {})">reconnect bridge now</button>
+</div>
+
+<h2>Settings in the robot</h2>
+<table id="prefs"></table>
+<p class="dim">A switch sends a request; the "robot says" column shows what the robot actually adopted.</p>
+
+<h2>Maintenance</h2>
+<table id="maintenance"></table>
+
+<h2>Counters (from the robot itself)</h2>
+<table id="counters"></table>
+<p class="dim"><a href="/api/report">report (JSON)</a> · <a href="/api/raw">full state (JSON)</a></p>
+
+<h2>Events</h2>
+<ul id="events"></ul>
+
+<script>
+const PREF_LABELS = {
+  imgUpload: ["Upload obstacle photos", [0, 1]],
+  mapUploadAllowed: ["Upload map", [false, true]],
+  pmapLearningAllowed: ["Map learning", [false, true]],
+  padWashAllowed: ["Wash pad in dock", [0, 1]],
+  padDryAllowed: ["Dry pad in dock", [0, 1]],
+  binPause: ["Pause when bin is full", [false, true]],
+  childLock: ["Child lock", [false, true]],
+};
+const PHASE = { charge: "charging", run: "running", stop: "stopped", pause: "paused", hmUsrDock: "returning to dock",
+  hmPostMsn: "returning to dock (done)", hmMidMsn: "returning to dock (mid-mission)", evac: "emptying bin",
+  refill: "refilling tank", padWash: "washing pad", padDry: "drying pad", stuck: "STUCK", charge_err: "CHARGE ERROR" };
+
+function val(sel) { const e = document.querySelector(sel + ":checked"); return e ? e.value : null; }
+function message(t, bad) { const m = document.getElementById("message"); m.textContent = t; m.className = bad ? "alarm" : "ok"; }
+
+async function post(url, body) {
+  const r = await fetch(url, { method: "POST", headers: { "Content-Type": "application/json" }, body: JSON.stringify(body) });
+  const j = await r.json();
+  message(j.ok ? "sent: " + JSON.stringify(j.sent || j) : "failed: " + (j.error || JSON.stringify(j)), !j.ok);
+  setTimeout(refresh, 1500);
+}
+function start() {
+  const regions = [...document.querySelectorAll("#rooms input:checked")].map(e => e.value);
+  post("/api/start", { mode: val("[name=mode]"), suction: val("[name=suction]"), water: val("[name=water]"),
+    scrub: document.getElementById("scrub").checked, padWashAfter: document.getElementById("padWashAfter").checked,
+    passes: val("[name=passes]"), regions });
+}
+function cmd(c) { post("/api/cmd", { command: c }); }
+function pref(k, v) { post("/api/prefs", { [k]: v }); }
+function rename(id, old) { const n = prompt("Name for room " + id + ":", old); if (n !== null) post("/api/rooms/name", { id, name: n }); }
+function replaced(k) { if (confirm("Mark as replaced today?")) post("/api/maintenance", { part: k }); }
+
+function row(th, td, cls) { return `<tr><th>${th}</th><td class="${cls || ""}">${td ?? "–"}</td></tr>`; }
+
+async function refresh() {
+  let s;
+  try { s = await (await fetch("/api/state")).json(); } catch (e) { document.getElementById("conn").textContent = "(server unreachable)"; return; }
+  document.getElementById("conn").textContent = s.connected ? "· connected" : "· NO CONNECTION " + (s.connection_error || "") + " (iRobot app open?)";
+  const d = s.dock || {}, bin = s.bin || {};
+  const alarm = [];
+  if (bin.full) alarm.push("bin full");
+  if (bin.present === false) alarm.push("bin missing");
+  if (s.robotTank && s.robotTank.present === false) alarm.push("tank missing");
+  if (d.water != null && d.water < 20) alarm.push("clean water low");
+  if (d.wasteWater != null && d.wasteWater > 80) alarm.push("waste water full");
+  if (d.error) alarm.push("dock error " + d.error);
+  if (s.error) alarm.push("robot error " + s.error);
+  if (s.notReady) alarm.push("not ready: code " + s.notReady);
+  document.getElementById("status").innerHTML =
+    row("Alerts", alarm.length ? alarm.join(", ") : "none", alarm.length ? "alarm" : "ok") +
+    row("Phase", (PHASE[s.phase] || s.phase) + (s.cycle && s.cycle !== "none" ? ` (${s.cycle}, ${s.missionMin ?? 0} min)` : "")) +
+    row("Battery", s.battery != null ? s.battery + " %" : null) +
+    row("Bin", bin.present ? (bin.full ? "FULL" : "ok") : "missing") +
+    row("Pad", s.pad) +
+    row("Dock clean water", d.water != null ? d.water + " %" : null) +
+    row("Dock waste water", d.wasteWater != null ? d.wasteWater + " %" : null) +
+    row("Dock status", `${d.state ?? "–"} · wash ${d.pwState ?? "–"} · dry ${d.pdState ?? "–"} · fill ${d.frState ?? "–"}`) +
+    row("Last message", s.last_message) +
+    row("Last command", s.lastCommand ? `${s.lastCommand.command} (${s.lastCommand.initiator})` : null);
+
+  let p = "";
+  for (const [k, [label, vals]] of Object.entries(PREF_LABELS)) {
+    const cur = s.prefs[k];
+    p += `<tr><th>${label}</th><td><b>robot says: ${cur ?? "?"}</b> &nbsp; <button onclick='pref("${k}", ${JSON.stringify(vals[0])})'>off</button><button onclick='pref("${k}", ${JSON.stringify(vals[1])})'>on</button></td></tr>`;
+  }
+  document.getElementById("prefs").innerHTML = p;
+
+  let o = "<tr><th>Part</th><td>replaced · since · status</td></tr>";
+  for (const r of s.maintenance) {
+    const since = r.since != null ? `${r.since} ${r.counter}` : "–";
+    const days = r.days != null ? `${r.days} days` : "–";
+    o += `<tr><th>${r.name}</th><td class="${r.status === "replace" ? "alarm" : ""}">${r.replaced_on || "never recorded"} · ${days} · ${since} · ${r.status} <button onclick='replaced("${r.key}")'>replaced now</button></td></tr>`;
+  }
+  document.getElementById("maintenance").innerHTML = o;
+
+  const t = s.counters || {};
+  document.getElementById("counters").innerHTML =
+    row("Missions total / ok / failed / cancelled", `${t.nMssn} / ${t.nMssnOk} / ${t.nMssnF} / ${t.nMssnC}`) +
+    row("Stuck", t.nStuck) + row("Main brush stalled", t.nMBStll) +
+    row("Bin evacuations", t.nEvacs) + row("Scrub runs", t.nScrubs);
+
+  const k = s.rooms || {};
+  if (k.regions && k.regions.length) {
+    document.getElementById("rooms").className = "row";
+    const chosen = new Set([...document.querySelectorAll("#rooms input:checked")].map(e => e.value));
+    document.getElementById("rooms").innerHTML = k.regions.map(r =>
+      `<label><input type="checkbox" value="${r.id}" ${chosen.has(r.id) ? "checked" : ""}> ${r.name || r.id}
+       <a href="#" class="dim" onclick='rename("${r.id}", "${(r.name || "").replace(/"/g, "")}"); return false;'>✎</a></label>`).join("");
+  }
+  document.getElementById("events").innerHTML = (s.events || []).map(e => `<li><span class="dim">${e.t.slice(5, 16).replace("T", " ")}</span> ${e.type}: ${e.text}</li>`).join("");
+}
+refresh();
+setInterval(refresh, 4000);
+</script>
+</body>
+</html>
