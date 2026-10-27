@@ -48,6 +48,7 @@ class Bridge:
         self._cycle_active = None      # None = no state seen yet
         self._evac_seen = False
         self._cycle_mode = None        # operatingMode of the current run (4 = mop only: no evac needed)
+        self._last_auto_evac = 0       # at most one auto-evac per 10 min (never a loop)
 
         c = mqtt.Client(mqtt.CallbackAPIVersion.VERSION2, client_id=blid,
                         protocol=mqtt.MQTTv311, clean_session=False)
@@ -154,21 +155,29 @@ class Bridge:
                 self.event(name, text, extra={"mission": dig(self.state, "cleanMissionStatus", "missionId")})
                 self._watch_prev[name] = snap
 
+    def _mode_from_lastcommand(self):
+        lc = self.state.get("lastCommand") or {}
+        p = lc.get("params") or ((lc.get("regions") or [{}])[0].get("params")) or {}
+        return p.get("operatingMode")
+
     def _auto_evac(self):
         cms = self.state.get("cleanMissionStatus") or {}
         cycle, phase = cms.get("cycle"), cms.get("phase")
-        active = cycle not in (None, "none")
+        active = cycle == "clean"  # only real cleaning runs; evac/dock cycles do not count (loop bug 2026-10-27)
         if self._cycle_active is None:  # first state after (re)start of the bridge
-            self._cycle_active, self._evac_seen, self._cycle_mode = active, False, cms.get("operatingMode")
+            self._cycle_active, self._evac_seen, self._cycle_mode = active, False, self._mode_from_lastcommand()
             return
-        if phase == "evac":
-            self._evac_seen = True
         if active and not self._cycle_active:            # a new run begins
-            self._evac_seen, self._cycle_mode = False, cms.get("operatingMode")
-        elif self._cycle_active and not active:           # run finished
+            # cleanMissionStatus.operatingMode is often still 0 at the start; the command itself is reliable
+            self._evac_seen, self._cycle_mode = False, self._mode_from_lastcommand() or cms.get("operatingMode")
+        if phase == "evac":                                # after the reset, or an evac in the same message is lost
+            self._evac_seen = True
+        if self._cycle_active and not active:             # run finished
             bin_ = self.state.get("bin") or {}
             if (phase == "charge" and not self._evac_seen and self._cycle_mode != 4
-                    and bin_.get("present") and self.state.get("evacAllowed", True)):
+                    and bin_.get("present") and self.state.get("evacAllowed", True)
+                    and time.time() - self._last_auto_evac > 600):
+                self._last_auto_evac = time.time()
                 self.event("autoEvac", f"run finished without an evac phase (mode {self._cycle_mode}); emptying the bin")
                 threading.Thread(target=self.command, args=("evac",), daemon=True).start()
         self._cycle_active = active
